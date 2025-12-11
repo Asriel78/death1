@@ -1,127 +1,175 @@
 import struct
 
 """
-Генератор task.bin для достижения целевых процентов:
-- instr_hit_rate: 92.3077% (12/13 обращений)
-- data_hit_rate: 50.0000% (ровно половина)
+Улучшенный генератор task.bin для Варианта 1
 
-Вариант 1 кэша:
+Параметры кэша:
 - 16 наборов × 4 линии = 64 линии
 - Размер линии: 64 байта
-- INDEX: 4 бита (биты 6-9 адреса)
-- OFFSET: 6 бит (биты 0-5)
+- INDEX: биты 6-9 адреса (4 бита)
+- OFFSET: биты 0-5 (6 бит)
+- TAG: биты 10-16 (7 бит)
 
-Стратегия:
-1. Инструкции (13 обращений):
-   - 1 miss (первое fetch)
-   - 12 hits (остальные в том же блоке или цикле)
-   
-2. Данные (нужно четное количество для 50%):
-   - Используем 2, 4, 6, 8... обращений
-   - Половина miss, половина hit
+Целевые проценты (укажите свои из таблицы):
+- instr_hit_rate: 92.3077% (пример: 12/13)
+- data_hit_rate: 50.0000% (пример: 4/8)
+
+Стратегия для 92.3077% instruction hit rate:
+- 13 инструкций, все в пределах одной кэш-линии (64 байта)
+- 13 × 4 = 52 байта < 64 байта
+- Результат: 1 miss (первая загрузка) + 12 hits = 92.3077%
+
+Стратегия для 50% data hit rate:
+- 8 обращений к данным (4 load + 4 store)
+- Используем 4 уникальных адреса
+- Каждый адрес: первое обращение = miss, второе = hit
+- Результат: 4 miss + 4 hit = 50%
 """
 
-def encode_r_type(opcode, rd, funct3, rs1, rs2, funct7):
-    """Кодирует R-type инструкцию"""
-    return (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
 
 def encode_i_type(opcode, rd, funct3, rs1, imm):
     """Кодирует I-type инструкцию"""
-    imm = imm & 0xFFF  # Обрезаем до 12 бит
+    imm = imm & 0xFFF
     return (imm << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+
 
 def encode_s_type(opcode, funct3, rs1, rs2, imm):
     """Кодирует S-type инструкцию"""
-    imm = imm & 0xFFF  # Обрезаем до 12 бит
+    imm = imm & 0xFFF
     imm_11_5 = (imm >> 5) & 0x7F
     imm_4_0 = imm & 0x1F
     return (imm_11_5 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (imm_4_0 << 7) | opcode
 
-def encode_b_type(opcode, funct3, rs1, rs2, imm):
-    """Кодирует B-type инструкцию"""
-    imm = imm & 0x1FFF  # Обрезаем до 13 бит
-    imm_12 = (imm >> 12) & 1
-    imm_10_5 = (imm >> 5) & 0x3F
-    imm_4_1 = (imm >> 1) & 0xF
-    imm_11 = (imm >> 11) & 1
-    return (imm_12 << 31) | (imm_10_5 << 25) | (rs2 << 20) | (rs1 << 15) | \
-           (funct3 << 12) | (imm_4_1 << 8) | (imm_11 << 7) | opcode
+
+def get_cache_info(addr):
+    """Вычисляет tag, index, offset для адреса"""
+    offset = addr & 0x3F  # биты 0-5
+    index = (addr >> 6) & 0xF  # биты 6-9
+    tag = (addr >> 10) & 0x7F  # биты 10-16
+    return tag, index, offset
+
+
+print("=" * 70)
+print("RISC-V Cache Test Generator - Variant 1")
+print("=" * 70)
 
 # Создаем task.bin
 with open('task.bin', 'wb') as f:
     # ========== РЕГИСТРЫ ==========
+    PC_START = 0x1000
+
     # PC = 0x1000 (начало программы)
-    f.write(struct.pack('<I', 0x1000))
-    
-    # x1 (ra) = 0x1034 (адрес возврата - после 13 инструкций = 0x1000 + 13*4)
-    f.write(struct.pack('<I', 0x1034))
-    
+    f.write(struct.pack('<I', PC_START))
+
+    # x1 (ra) - адрес возврата (вычислим после создания инструкций)
+    ra_position = f.tell()
+    f.write(struct.pack('<I', 0))  # временно 0
+
     # x2-x31 = 0
     for i in range(2, 32):
         f.write(struct.pack('<I', 0))
-    
+
     # ========== КОД (ИНСТРУКЦИИ) ==========
-    # Адрес: 0x1000
-    # Программа: 13 инструкций (52 байта)
-    # Все инструкции в пределах одной кэш-линии (64 байта)
-    # -> 1 miss (первое fetch) + 12 hits = 92.3077%
-    
     instructions = []
-    
-    # Инициализация (2 инструкции)
-    instructions.append(encode_i_type(0x13, 2, 0, 0, 0x2000))   # addi x2, x0, 0x2000 (базовый адрес данных)
-    instructions.append(encode_i_type(0x13, 3, 0, 0, 4))        # addi x3, x0, 4 (счетчик)
-    
-    # Первое обращение к данным (2 инструкции)
-    instructions.append(encode_i_type(0x03, 4, 2, 2, 0))        # lw x4, 0(x2)     - load 1
-    instructions.append(encode_s_type(0x23, 2, 2, 4, 0))        # sw x4, 0(x2)     - store 1
-    
-    # Смещение и второе обращение (3 инструкции)
-    instructions.append(encode_i_type(0x13, 2, 0, 2, 1024))     # addi x2, x2, 1024
-    instructions.append(encode_i_type(0x03, 4, 2, 2, 0))        # lw x4, 0(x2)     - load 2
-    instructions.append(encode_s_type(0x23, 2, 2, 4, 0))        # sw x4, 0(x2)     - store 2
-    
-    # Смещение и третье обращение (3 инструкции)
-    instructions.append(encode_i_type(0x13, 2, 0, 2, 1024))     # addi x2, x2, 1024
-    instructions.append(encode_i_type(0x03, 4, 2, 2, 0))        # lw x4, 0(x2)     - load 3
-    instructions.append(encode_s_type(0x23, 2, 2, 4, 0))        # sw x4, 0(x2)     - store 3
-    
-    # Смещение и четвертое обращение (3 инструкции)
-    instructions.append(encode_i_type(0x13, 2, 0, 2, 1024))     # addi x2, x2, 1024
-    instructions.append(encode_i_type(0x03, 4, 2, 2, 0))        # lw x4, 0(x2)     - load 4
-    instructions.append(encode_s_type(0x23, 2, 2, 4, 0))        # sw x4, 0(x2)     - store 4
-    
-    # Итого: 2 + 2 + 3 + 3 + 3 = 13 инструкций
-    # PC дойдет до 0x1034 (0x1000 + 13*4) и затем до 0x1040 не дойдет
-    # Нужно поправить ra!
-    
-    # Записываем фрагмент с кодом
-    code_addr = 0x1000
+
+    # Все 13 инструкций будут в одной кэш-линии
+    # Адрес начала: 0x1000 (offset=0, index=0, tag=4)
+
+    # 1. Инициализация базового адреса данных
+    instructions.append(encode_i_type(0x13, 2, 0, 0, 0x2000))  # addi x2, x0, 0x2000
+
+    # Группа 1: два обращения к адресу 0x2000
+    # 2-3. Load дважды из одного адреса
+    instructions.append(encode_i_type(0x03, 3, 2, 2, 0))  # lw x3, 0(x2)   [MISS]
+    instructions.append(encode_i_type(0x03, 4, 2, 2, 0))  # lw x4, 0(x2)   [HIT]
+
+    # Группа 2: смещение + load + store
+    # 4. Смещение на следующую кэш-линию
+    instructions.append(encode_i_type(0x13, 2, 0, 2, 64))  # addi x2, x2, 64
+    # 5-6. Load + Store
+    instructions.append(encode_i_type(0x03, 3, 2, 2, 0))  # lw x3, 0(x2)   [MISS]
+    instructions.append(encode_s_type(0x23, 2, 2, 3, 0))  # sw x3, 0(x2)   [HIT]
+
+    # Группа 3: смещение + load + store
+    # 7. Смещение
+    instructions.append(encode_i_type(0x13, 2, 0, 2, 64))  # addi x2, x2, 64
+    # 8-9. Load + Store
+    instructions.append(encode_i_type(0x03, 3, 2, 2, 0))  # lw x3, 0(x2)   [MISS]
+    instructions.append(encode_s_type(0x23, 2, 2, 3, 0))  # sw x3, 0(x2)   [HIT]
+
+    # Группа 4: смещение + load + store
+    # 10. Смещение
+    instructions.append(encode_i_type(0x13, 2, 0, 2, 64))  # addi x2, x2, 64
+    # 11-12. Load + Store
+    instructions.append(encode_i_type(0x03, 3, 2, 2, 0))  # lw x3, 0(x2)   [MISS]
+    instructions.append(encode_s_type(0x23, 2, 2, 3, 0))  # sw x3, 0(x2)   [HIT]
+
+    # 13. NOP для завершения (не обязательно, но хорошая практика)
+    instructions.append(encode_i_type(0x13, 0, 0, 0, 0))  # addi x0, x0, 0 (NOP)
+
+    assert len(instructions) == 13, f"Expected 13 instructions, got {len(instructions)}"
+
+    # Вычисляем адрес возврата
     code_size = len(instructions) * 4
-    
-    f.write(struct.pack('<I', code_addr))
+    return_addr = PC_START + code_size
+
+    # Обновляем x1 (ra)
+    current_pos = f.tell()
+    f.seek(ra_position)
+    f.write(struct.pack('<I', return_addr))
+    f.seek(current_pos)
+
+    # Выводим информацию о коде
+    print(f"\nCode segment:")
+    print(f"  Address: 0x{PC_START:04X} - 0x{PC_START + code_size - 1:04X}")
+    print(f"  Size: {code_size} bytes ({len(instructions)} instructions)")
+    tag, index, offset = get_cache_info(PC_START)
+    print(f"  Cache: tag=0x{tag:02X}, index={index}, offset={offset}")
+    print(f"  Return address (ra): 0x{return_addr:04X}")
+
+    # Записываем фрагмент с кодом
+    f.write(struct.pack('<I', PC_START))
     f.write(struct.pack('<I', code_size))
     for instr in instructions:
-        f.write(struct.pack('<I', instr & 0xFFFFFFFF))  # Маска для unsigned
-    
-    # ========== ДАННЫЕ ==========
-    # Адреса: 0x2000, 0x2400, 0x2800, 0x2C00
-    # Смещение 1024 байта = 16 кэш-линий
-    # Используем set 0 (биты 6-9 = 0000)
-    
-    # 4 фрагмента данных (по 4 байта)
-    data_addresses = [0x2000, 0x2400, 0x2800, 0x2C00]
-    
-    for addr in data_addresses:
-        f.write(struct.pack('<I', addr))
-        f.write(struct.pack('<I', 4))  # размер
-        f.write(struct.pack('<I', 0))  # значение = 0
+        f.write(struct.pack('<I', instr & 0xFFFFFFFF))
 
+    # ========== ДАННЫЕ ==========
+    # 4 адреса данных со смещением 64 байта (одна кэш-линия)
+    data_addresses = [0x2000, 0x2040, 0x2080, 0x20C0]
+
+    print(f"\nData segments:")
+    for i, addr in enumerate(data_addresses):
+        tag, index, offset = get_cache_info(addr)
+        print(f"  #{i + 1}: 0x{addr:04X} -> tag=0x{tag:02X}, index={index}, offset={offset}")
+
+        f.write(struct.pack('<I', addr))
+        f.write(struct.pack('<I', 4))
+        f.write(struct.pack('<I', 0x12345678 + i))
+
+print("\n" + "=" * 70)
 print("✓ Created task.bin")
-print()
-print("Expected results:")
-print("  Instructions: 13 accesses, 12 hits → 92.3077%")
-print("  Data: 8 accesses (4 loads + 4 stores)")
-print("    - With evictions → 50% hit rate")
-print()
-print("Run: riscv_emu -i task.bin")
+print("=" * 70)
+
+print("\nExpected cache behavior:")
+print("\n1. INSTRUCTIONS (13 accesses):")
+print("   - All 13 instructions fit in one cache line (52 bytes < 64 bytes)")
+print("   - First fetch: MISS (load cache line)")
+print("   - Next 12 fetches: HIT (already in cache)")
+print("   - Hit rate: 12/13 = 92.3077%")
+
+print("\n2. DATA (8 accesses):")
+print("   - Address 0x2000: load (MISS) + load (HIT)")
+print("   - Address 0x2040: load (MISS) + store (HIT)")
+print("   - Address 0x2080: load (MISS) + store (HIT)")
+print("   - Address 0x20C0: load (MISS) + store (HIT)")
+print("   - Total: 4 MISS + 4 HIT = 50.0000%")
+
+print("\n3. OVERALL:")
+print("   - Total accesses: 13 (instr) + 8 (data) = 21")
+print("   - Total hits: 12 (instr) + 4 (data) = 16")
+print("   - Overall hit rate: 16/21 = 76.1905%")
+
+print("\n" + "=" * 70)
+print("Run with: ./riscv_emu -i task.bin")
+print("Debug mode: ./riscv_emu -i task.bin -d")
+print("=" * 70)
