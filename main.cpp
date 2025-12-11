@@ -6,51 +6,75 @@
 #include <map>
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 // ============================================================================
 // CACHE CONFIGURATION (Variant 1)
 // ============================================================================
-const uint32_t MEMORY_SIZE = 128 * 1024;      // 128 KBytes
-const uint32_t ADDRESS_LEN = 17;              // 17 bits
+const uint32_t MEMORY_SIZE = 128 * 1024;      // 128 KBytes (calculated: 2^17)
+const uint32_t ADDRESS_LEN = 17;              // 17 bits (given)
 const uint32_t CACHE_TAG_LEN = 7;             // 7 bits (calculated: 17 - 4 - 6)
-const uint32_t CACHE_INDEX_LEN = 4;           // 4 bits
+const uint32_t CACHE_INDEX_LEN = 4;           // 4 bits (given)
 const uint32_t CACHE_OFFSET_LEN = 6;          // 6 bits (calculated: log2(64))
 const uint32_t CACHE_SIZE = 4 * 1024;         // 4 KBytes (calculated: 64 lines * 64 bytes)
-const uint32_t CACHE_LINE_SIZE = 64;          // 64 bytes
-const uint32_t CACHE_LINE_COUNT = 64;         // 64 lines
+const uint32_t CACHE_LINE_SIZE = 64;          // 64 bytes (given)
+const uint32_t CACHE_LINE_COUNT = 64;         // 64 lines (given)
 const uint32_t CACHE_SET_COUNT = 16;          // 16 sets (calculated: 2^4)
 const uint32_t CACHE_WAY = 4;                 // 4-way associative (calculated: 64/16)
+
+// Глобальный флаг отладки
+bool g_debug = false;
 
 // ============================================================================
 // MEMORY & REGISTERS
 // ============================================================================
 class Memory {
+private:
+    const uint32_t MAX_ADDRESS = (1 << ADDRESS_LEN) - 1;
+    
 public:
     std::map<uint32_t, uint8_t> data;
     
+    void validate_address(uint32_t addr) {
+        if (addr > MAX_ADDRESS) {
+            throw std::runtime_error("Address out of range: 0x" + 
+                std::to_string(addr) + " (max: 0x" + std::to_string(MAX_ADDRESS) + ")");
+        }
+    }
+    
     uint8_t read8(uint32_t addr) {
+        validate_address(addr);
         return data[addr];
     }
     
     uint16_t read16(uint32_t addr) {
+        validate_address(addr);
+        validate_address(addr + 1);
         return read8(addr) | (read8(addr + 1) << 8);
     }
     
     uint32_t read32(uint32_t addr) {
+        validate_address(addr);
+        validate_address(addr + 3);
         return read8(addr) | (read8(addr + 1) << 8) | 
                (read8(addr + 2) << 16) | (read8(addr + 3) << 24);
     }
     
     void write8(uint32_t addr, uint8_t val) {
+        validate_address(addr);
         data[addr] = val;
     }
     
     void write16(uint32_t addr, uint16_t val) {
+        validate_address(addr);
+        validate_address(addr + 1);
         write8(addr, val & 0xFF);
         write8(addr + 1, (val >> 8) & 0xFF);
     }
     
     void write32(uint32_t addr, uint32_t val) {
+        validate_address(addr);
+        validate_address(addr + 3);
         write8(addr, val & 0xFF);
         write8(addr + 1, (val >> 8) & 0xFF);
         write8(addr + 2, (val >> 16) & 0xFF);
@@ -66,7 +90,7 @@ struct CacheLine {
     uint32_t tag = 0;
     uint8_t data[CACHE_LINE_SIZE];
     bool dirty = false;
-    uint32_t lru_counter = 0;  // For LRU
+    uint32_t lru_counter = 0;
 };
 
 // ============================================================================
@@ -76,14 +100,16 @@ class Cache {
 public:
     CacheLine sets[CACHE_SET_COUNT][CACHE_WAY];
     uint32_t global_counter = 0;
+    uint8_t plru_bits[CACHE_SET_COUNT];
     
-    // bit-pLRU: binary tree bits for each set
-    // For 4-way: need 3 bits per set (tree structure: root, left child, right child)
-    uint8_t plru_bits[CACHE_SET_COUNT]; // 3 bits used per set (16 sets for variant 1)
-    
-    // Statistics
-    uint64_t instr_access = 0, instr_hit = 0;
-    uint64_t data_access = 0, data_hit = 0;
+    // Детальная статистика
+    struct Statistics {
+        uint64_t instr_access = 0, instr_hit = 0, instr_miss = 0;
+        uint64_t data_read_access = 0, data_read_hit = 0, data_read_miss = 0;
+        uint64_t data_write_access = 0, data_write_hit = 0, data_write_miss = 0;
+        uint64_t evictions = 0;
+        uint64_t writebacks = 0;
+    } stats;
     
     Memory* memory;
     
@@ -107,7 +133,6 @@ public:
         return addr & ~((1 << CACHE_OFFSET_LEN) - 1);
     }
     
-    // Load cache line from memory
     void load_line(uint32_t set_idx, uint32_t way_idx, uint32_t addr) {
         uint32_t block_addr = get_block_addr(addr);
         CacheLine& line = sets[set_idx][way_idx];
@@ -119,6 +144,7 @@ public:
             for (uint32_t i = 0; i < CACHE_LINE_SIZE; i++) {
                 memory->write8(old_addr + i, line.data[i]);
             }
+            stats.writebacks++;
         }
         
         // Load new line
@@ -128,9 +154,13 @@ public:
         for (uint32_t i = 0; i < CACHE_LINE_SIZE; i++) {
             line.data[i] = memory->read8(block_addr + i);
         }
+        
+        if (g_debug) {
+            printf("  [CACHE] Loaded line: addr=0x%08X, set=%u, way=%u, tag=0x%02X\n",
+                   block_addr, set_idx, way_idx, line.tag);
+        }
     }
     
-    // LRU: find victim
     uint32_t find_lru_victim(uint32_t set_idx) {
         uint32_t victim = 0;
         uint32_t min_counter = sets[set_idx][0].lru_counter;
@@ -145,26 +175,18 @@ public:
         return victim;
     }
     
-    // bit-pLRU: find victim using tree bits
     uint32_t find_plru_victim(uint32_t set_idx) {
         // For 4-way: bit0 = root, bit1 = left subtree, bit2 = right subtree
-        // Tree structure:
-        //        bit0
-        //       /    \
-        //    bit1    bit2
-        //    / \      / \
-        //   w0 w1    w2 w3
-        
         uint8_t bits = plru_bits[set_idx];
         uint32_t way;
         
-        if ((bits & 0x1) == 0) {  // bit0 = 0, go left
-            way = (bits & 0x2) ? 1 : 0;  // bit1
-        } else {  // bit0 = 1, go right
-            way = (bits & 0x4) ? 3 : 2;  // bit2
+        if ((bits & 0x1) == 0) {
+            way = (bits & 0x2) ? 1 : 0;
+        } else {
+            way = (bits & 0x4) ? 3 : 2;
         }
         
-        // Check if any line is invalid first
+        // Check invalid lines first
         for (uint32_t i = 0; i < CACHE_WAY; i++) {
             if (!sets[set_idx][i].valid) return i;
         }
@@ -172,34 +194,42 @@ public:
         return way;
     }
     
-    // Update bit-pLRU on access
     void update_plru(uint32_t set_idx, uint32_t way) {
         uint8_t& bits = plru_bits[set_idx];
         
-        // Update tree bits based on accessed way
         if (way == 0 || way == 1) {
-            bits |= 0x1;   // Set bit0 to 1 (point away from left)
-            if (way == 0) bits |= 0x2;   // Set bit1
-            else bits &= ~0x2;           // Clear bit1
+            bits |= 0x1;
+            if (way == 0) bits |= 0x2;
+            else bits &= ~0x2;
         } else {
-            bits &= ~0x1;  // Clear bit0 (point away from right)
-            if (way == 2) bits |= 0x4;   // Set bit2
-            else bits &= ~0x4;           // Clear bit2
+            bits &= ~0x1;
+            if (way == 2) bits |= 0x4;
+            else bits &= ~0x4;
         }
     }
     
-    // Access cache (unified for instruction and data)
     uint32_t access(uint32_t addr, bool is_write, uint32_t write_data, 
                     uint32_t size, bool is_instruction, bool use_lru) {
+        // Валидация
+        if (size != 1 && size != 2 && size != 4) {
+            throw std::runtime_error("Invalid access size: " + std::to_string(size));
+        }
+        
+        uint32_t offset = get_offset(addr);
+        if (offset + size > CACHE_LINE_SIZE) {
+            throw std::runtime_error("Access crosses cache line boundary at 0x" + 
+                std::to_string(addr));
+        }
+        
         uint32_t tag = get_tag(addr);
         uint32_t set_idx = get_index(addr);
-        uint32_t offset = get_offset(addr);
         
         // Update statistics
         if (is_instruction) {
-            instr_access++;
+            stats.instr_access++;
         } else {
-            data_access++;
+            if (is_write) stats.data_write_access++;
+            else stats.data_read_access++;
         }
         
         // Check for hit
@@ -212,11 +242,19 @@ public:
         }
         
         if (hit_way != -1) {
-            // Hit!
+            // HIT
             if (is_instruction) {
-                instr_hit++;
+                stats.instr_hit++;
             } else {
-                data_hit++;
+                if (is_write) stats.data_write_hit++;
+                else stats.data_read_hit++;
+            }
+            
+            if (g_debug) {
+                printf("  [CACHE] HIT: addr=0x%08X, set=%u, way=%d, %s%s\n",
+                       addr, set_idx, hit_way, 
+                       is_instruction ? "INSTR" : "DATA",
+                       is_write ? " WRITE" : " READ");
             }
             
             // Update LRU/pLRU
@@ -252,8 +290,24 @@ public:
             }
             return result;
         } else {
-            // Miss - find victim and load
+            // MISS
+            if (is_instruction) {
+                stats.instr_miss++;
+            } else {
+                if (is_write) stats.data_write_miss++;
+                else stats.data_read_miss++;
+            }
+            stats.evictions++;
+            
             uint32_t victim = use_lru ? find_lru_victim(set_idx) : find_plru_victim(set_idx);
+            
+            if (g_debug) {
+                printf("  [CACHE] MISS: addr=0x%08X, set=%u, victim_way=%u, %s%s\n",
+                       addr, set_idx, victim,
+                       is_instruction ? "INSTR" : "DATA",
+                       is_write ? " WRITE" : " READ");
+            }
+            
             load_line(set_idx, victim, addr);
             
             // Update LRU/pLRU
@@ -304,6 +358,28 @@ public:
             }
         }
     }
+    
+    void print_detailed_stats() {
+        uint64_t total_data = stats.data_read_access + stats.data_write_access;
+        uint64_t total_data_hit = stats.data_read_hit + stats.data_write_hit;
+        
+        printf("\n╔════════════════════════════════════════════════════════╗\n");
+        printf("║              Detailed Cache Statistics                ║\n");
+        printf("╠════════════════════════════════════════════════════════╣\n");
+        printf("║ Instructions:                                          ║\n");
+        printf("║   Total: %-12lu Hits: %-12lu Misses: %-6lu ║\n", 
+               stats.instr_access, stats.instr_hit, stats.instr_miss);
+        printf("║ Data Reads:                                            ║\n");
+        printf("║   Total: %-12lu Hits: %-12lu Misses: %-6lu ║\n",
+               stats.data_read_access, stats.data_read_hit, stats.data_read_miss);
+        printf("║ Data Writes:                                           ║\n");
+        printf("║   Total: %-12lu Hits: %-12lu Misses: %-6lu ║\n",
+               stats.data_write_access, stats.data_write_hit, stats.data_write_miss);
+        printf("║ Cache Management:                                      ║\n");
+        printf("║   Evictions: %-12lu Writebacks: %-17lu ║\n",
+               stats.evictions, stats.writebacks);
+        printf("╚════════════════════════════════════════════════════════╝\n");
+    }
 };
 
 // ============================================================================
@@ -328,6 +404,15 @@ public:
         delete cache;
     }
     
+    void check_alignment(uint32_t addr, uint32_t size) {
+        if (addr % size != 0) {
+            if (g_debug) {
+                std::cerr << "Warning: Unaligned access at 0x" << std::hex << addr 
+                          << " (size=" << std::dec << size << ")" << std::endl;
+            }
+        }
+    }
+    
     int32_t sign_extend(uint32_t val, int bits) {
         if (val & (1 << (bits - 1))) {
             return val | (~((1 << bits) - 1));
@@ -336,6 +421,9 @@ public:
     }
     
     uint32_t fetch() {
+        if (g_debug) {
+            printf("[FETCH] PC=0x%08X\n", pc);
+        }
         uint32_t instr = cache->access(pc, false, 0, 4, true, use_lru);
         return instr;
     }
@@ -348,99 +436,89 @@ public:
         uint32_t rs2 = (instr >> 20) & 0x1F;
         uint32_t funct7 = (instr >> 25) & 0x7F;
         
-        regs[0] = 0; // x0 always 0
+        regs[0] = 0;
+        
+        if (g_debug) {
+            printf("[EXEC] PC=0x%08X, instr=0x%08X, opcode=0x%02X\n", pc, instr, opcode);
+        }
         
         switch (opcode) {
-            case 0x33: { // R-type (ADD, SUB, MUL, etc.)
-                if (funct7 == 0x00 && funct3 == 0x0) { // ADD
-                    regs[rd] = regs[rs1] + regs[rs2];
-                } else if (funct7 == 0x20 && funct3 == 0x0) { // SUB
-                    regs[rd] = regs[rs1] - regs[rs2];
-                } else if (funct7 == 0x00 && funct3 == 0x4) { // XOR
-                    regs[rd] = regs[rs1] ^ regs[rs2];
-                } else if (funct7 == 0x00 && funct3 == 0x6) { // OR
-                    regs[rd] = regs[rs1] | regs[rs2];
-                } else if (funct7 == 0x00 && funct3 == 0x7) { // AND
-                    regs[rd] = regs[rs1] & regs[rs2];
-                } else if (funct7 == 0x00 && funct3 == 0x1) { // SLL
-                    regs[rd] = regs[rs1] << (regs[rs2] & 0x1F);
-                } else if (funct7 == 0x00 && funct3 == 0x5) { // SRL
-                    regs[rd] = regs[rs1] >> (regs[rs2] & 0x1F);
-                } else if (funct7 == 0x20 && funct3 == 0x5) { // SRA
-                    regs[rd] = ((int32_t)regs[rs1]) >> (regs[rs2] & 0x1F);
-                } else if (funct7 == 0x00 && funct3 == 0x2) { // SLT
-                    regs[rd] = ((int32_t)regs[rs1] < (int32_t)regs[rs2]) ? 1 : 0;
-                } else if (funct7 == 0x00 && funct3 == 0x3) { // SLTU
-                    regs[rd] = (regs[rs1] < regs[rs2]) ? 1 : 0;
-                }
-                // RV32M
-                else if (funct7 == 0x01 && funct3 == 0x0) { // MUL
-                    regs[rd] = regs[rs1] * regs[rs2];
-                } else if (funct7 == 0x01 && funct3 == 0x1) { // MULH
+            case 0x33: { // R-type
+                if (funct7 == 0x00 && funct3 == 0x0) regs[rd] = regs[rs1] + regs[rs2];
+                else if (funct7 == 0x20 && funct3 == 0x0) regs[rd] = regs[rs1] - regs[rs2];
+                else if (funct7 == 0x00 && funct3 == 0x4) regs[rd] = regs[rs1] ^ regs[rs2];
+                else if (funct7 == 0x00 && funct3 == 0x6) regs[rd] = regs[rs1] | regs[rs2];
+                else if (funct7 == 0x00 && funct3 == 0x7) regs[rd] = regs[rs1] & regs[rs2];
+                else if (funct7 == 0x00 && funct3 == 0x1) regs[rd] = regs[rs1] << (regs[rs2] & 0x1F);
+                else if (funct7 == 0x00 && funct3 == 0x5) regs[rd] = regs[rs1] >> (regs[rs2] & 0x1F);
+                else if (funct7 == 0x20 && funct3 == 0x5) regs[rd] = ((int32_t)regs[rs1]) >> (regs[rs2] & 0x1F);
+                else if (funct7 == 0x00 && funct3 == 0x2) regs[rd] = ((int32_t)regs[rs1] < (int32_t)regs[rs2]) ? 1 : 0;
+                else if (funct7 == 0x00 && funct3 == 0x3) regs[rd] = (regs[rs1] < regs[rs2]) ? 1 : 0;
+                else if (funct7 == 0x01 && funct3 == 0x0) regs[rd] = regs[rs1] * regs[rs2];
+                else if (funct7 == 0x01 && funct3 == 0x1) {
                     int64_t result = (int64_t)(int32_t)regs[rs1] * (int64_t)(int32_t)regs[rs2];
                     regs[rd] = result >> 32;
-                } else if (funct7 == 0x01 && funct3 == 0x2) { // MULHSU
+                }
+                else if (funct7 == 0x01 && funct3 == 0x2) {
                     int64_t result = (int64_t)(int32_t)regs[rs1] * (uint64_t)regs[rs2];
                     regs[rd] = result >> 32;
-                } else if (funct7 == 0x01 && funct3 == 0x3) { // MULHU
+                }
+                else if (funct7 == 0x01 && funct3 == 0x3) {
                     uint64_t result = (uint64_t)regs[rs1] * (uint64_t)regs[rs2];
                     regs[rd] = result >> 32;
-                } else if (funct7 == 0x01 && funct3 == 0x4) { // DIV
+                }
+                else if (funct7 == 0x01 && funct3 == 0x4) {
                     if (regs[rs2] == 0) regs[rd] = -1;
                     else regs[rd] = (int32_t)regs[rs1] / (int32_t)regs[rs2];
-                } else if (funct7 == 0x01 && funct3 == 0x5) { // DIVU
+                }
+                else if (funct7 == 0x01 && funct3 == 0x5) {
                     if (regs[rs2] == 0) regs[rd] = 0xFFFFFFFF;
                     else regs[rd] = regs[rs1] / regs[rs2];
-                } else if (funct7 == 0x01 && funct3 == 0x6) { // REM
+                }
+                else if (funct7 == 0x01 && funct3 == 0x6) {
                     if (regs[rs2] == 0) regs[rd] = regs[rs1];
                     else regs[rd] = (int32_t)regs[rs1] % (int32_t)regs[rs2];
-                } else if (funct7 == 0x01 && funct3 == 0x7) { // REMU
+                }
+                else if (funct7 == 0x01 && funct3 == 0x7) {
                     if (regs[rs2] == 0) regs[rd] = regs[rs1];
                     else regs[rd] = regs[rs1] % regs[rs2];
                 }
                 pc += 4;
                 break;
             }
-            case 0x13: { // I-type (ADDI, SLTI, etc.)
+            case 0x13: { // I-type
                 int32_t imm = sign_extend((instr >> 20) & 0xFFF, 12);
-                if (funct3 == 0x0) { // ADDI
-                    regs[rd] = regs[rs1] + imm;
-                } else if (funct3 == 0x4) { // XORI
-                    regs[rd] = regs[rs1] ^ imm;
-                } else if (funct3 == 0x6) { // ORI
-                    regs[rd] = regs[rs1] | imm;
-                } else if (funct3 == 0x7) { // ANDI
-                    regs[rd] = regs[rs1] & imm;
-                } else if (funct3 == 0x1) { // SLLI
-                    regs[rd] = regs[rs1] << (imm & 0x1F);
-                } else if (funct3 == 0x5) {
-                    if ((instr >> 30) & 1) { // SRAI
-                        regs[rd] = ((int32_t)regs[rs1]) >> (imm & 0x1F);
-                    } else { // SRLI
-                        regs[rd] = regs[rs1] >> (imm & 0x1F);
-                    }
-                } else if (funct3 == 0x2) { // SLTI
-                    regs[rd] = ((int32_t)regs[rs1] < imm) ? 1 : 0;
-                } else if (funct3 == 0x3) { // SLTIU
-                    regs[rd] = (regs[rs1] < (uint32_t)imm) ? 1 : 0;
+                if (funct3 == 0x0) regs[rd] = regs[rs1] + imm;
+                else if (funct3 == 0x4) regs[rd] = regs[rs1] ^ imm;
+                else if (funct3 == 0x6) regs[rd] = regs[rs1] | imm;
+                else if (funct3 == 0x7) regs[rd] = regs[rs1] & imm;
+                else if (funct3 == 0x1) regs[rd] = regs[rs1] << (imm & 0x1F);
+                else if (funct3 == 0x5) {
+                    if ((instr >> 30) & 1) regs[rd] = ((int32_t)regs[rs1]) >> (imm & 0x1F);
+                    else regs[rd] = regs[rs1] >> (imm & 0x1F);
                 }
+                else if (funct3 == 0x2) regs[rd] = ((int32_t)regs[rs1] < imm) ? 1 : 0;
+                else if (funct3 == 0x3) regs[rd] = (regs[rs1] < (uint32_t)imm) ? 1 : 0;
                 pc += 4;
                 break;
             }
             case 0x03: { // Load
                 int32_t imm = sign_extend((instr >> 20) & 0xFFF, 12);
                 uint32_t addr = regs[rs1] + imm;
-                if (funct3 == 0x0) { // LB
+                if (funct3 == 0x0) {
                     uint8_t val = cache->access(addr, false, 0, 1, false, use_lru);
                     regs[rd] = sign_extend(val, 8);
-                } else if (funct3 == 0x1) { // LH
+                } else if (funct3 == 0x1) {
+                    check_alignment(addr, 2);
                     uint16_t val = cache->access(addr, false, 0, 2, false, use_lru);
                     regs[rd] = sign_extend(val, 16);
-                } else if (funct3 == 0x2) { // LW
+                } else if (funct3 == 0x2) {
+                    check_alignment(addr, 4);
                     regs[rd] = cache->access(addr, false, 0, 4, false, use_lru);
-                } else if (funct3 == 0x4) { // LBU
+                } else if (funct3 == 0x4) {
                     regs[rd] = cache->access(addr, false, 0, 1, false, use_lru);
-                } else if (funct3 == 0x5) { // LHU
+                } else if (funct3 == 0x5) {
+                    check_alignment(addr, 2);
                     regs[rd] = cache->access(addr, false, 0, 2, false, use_lru);
                 }
                 pc += 4;
@@ -449,11 +527,13 @@ public:
             case 0x23: { // Store
                 int32_t imm = sign_extend(((instr >> 25) << 5) | rd, 12);
                 uint32_t addr = regs[rs1] + imm;
-                if (funct3 == 0x0) { // SB
+                if (funct3 == 0x0) {
                     cache->access(addr, true, regs[rs2] & 0xFF, 1, false, use_lru);
-                } else if (funct3 == 0x1) { // SH
+                } else if (funct3 == 0x1) {
+                    check_alignment(addr, 2);
                     cache->access(addr, true, regs[rs2] & 0xFFFF, 2, false, use_lru);
-                } else if (funct3 == 0x2) { // SW
+                } else if (funct3 == 0x2) {
+                    check_alignment(addr, 4);
                     cache->access(addr, true, regs[rs2], 4, false, use_lru);
                 }
                 pc += 4;
@@ -464,12 +544,12 @@ public:
                     ((instr >> 31) << 12) | (((instr >> 7) & 1) << 11) |
                     (((instr >> 25) & 0x3F) << 5) | (((instr >> 8) & 0xF) << 1), 13);
                 bool taken = false;
-                if (funct3 == 0x0) taken = (regs[rs1] == regs[rs2]); // BEQ
-                else if (funct3 == 0x1) taken = (regs[rs1] != regs[rs2]); // BNE
-                else if (funct3 == 0x4) taken = ((int32_t)regs[rs1] < (int32_t)regs[rs2]); // BLT
-                else if (funct3 == 0x5) taken = ((int32_t)regs[rs1] >= (int32_t)regs[rs2]); // BGE
-                else if (funct3 == 0x6) taken = (regs[rs1] < regs[rs2]); // BLTU
-                else if (funct3 == 0x7) taken = (regs[rs1] >= regs[rs2]); // BGEU
+                if (funct3 == 0x0) taken = (regs[rs1] == regs[rs2]);
+                else if (funct3 == 0x1) taken = (regs[rs1] != regs[rs2]);
+                else if (funct3 == 0x4) taken = ((int32_t)regs[rs1] < (int32_t)regs[rs2]);
+                else if (funct3 == 0x5) taken = ((int32_t)regs[rs1] >= (int32_t)regs[rs2]);
+                else if (funct3 == 0x6) taken = (regs[rs1] < regs[rs2]);
+                else if (funct3 == 0x7) taken = (regs[rs1] >= regs[rs2]);
                 
                 if (taken) pc += imm;
                 else pc += 4;
@@ -503,9 +583,11 @@ public:
                 break;
             }
             case 0x73: { // ECALL/EBREAK
-                return; // Terminate
+                if (g_debug) printf("[EXEC] ECALL/EBREAK - terminating\n");
+                return;
             }
             default:
+                if (g_debug) printf("[EXEC] Unknown opcode: 0x%02X\n", opcode);
                 pc += 4;
                 break;
         }
@@ -515,7 +597,7 @@ public:
     
     void run() {
         uint64_t instruction_count = 0;
-        const uint64_t MAX_INSTRUCTIONS = 1000000; // Защита от бесконечного цикла
+        const uint64_t MAX_INSTRUCTIONS = 1000000;
         
         while (pc != initial_ra && instruction_count < MAX_INSTRUCTIONS) {
             uint32_t instr = fetch();
@@ -526,6 +608,10 @@ public:
         if (instruction_count >= MAX_INSTRUCTIONS) {
             std::cerr << "Warning: Reached max instruction limit (" << MAX_INSTRUCTIONS << ")" << std::endl;
             std::cerr << "PC = 0x" << std::hex << pc << ", initial_ra = 0x" << initial_ra << std::dec << std::endl;
+        }
+        
+        if (g_debug) {
+            printf("\n[RUN] Executed %lu instructions\n", instruction_count);
         }
         
         cache->flush();
@@ -539,14 +625,12 @@ bool read_input_file(const char* filename, RiscVEmulator& emu) {
     std::ifstream file(filename, std::ios::binary);
     if (!file) return false;
     
-    // Read registers (32 * 4 bytes)
     file.read((char*)&emu.pc, 4);
     for (int i = 1; i < 32; i++) {
         file.read((char*)&emu.regs[i], 4);
     }
-    emu.initial_ra = emu.regs[1]; // ra = x1
+    emu.initial_ra = emu.regs[1];
     
-    // Read memory fragments
     while (file.peek() != EOF) {
         uint32_t addr, size;
         file.read((char*)&addr, 4);
@@ -559,6 +643,10 @@ bool read_input_file(const char* filename, RiscVEmulator& emu) {
         }
     }
     
+    if (g_debug) {
+        printf("[FILE] Loaded: PC=0x%08X, RA=0x%08X\n", emu.pc, emu.initial_ra);
+    }
+    
     return true;
 }
 
@@ -567,13 +655,11 @@ bool write_output_file(const char* filename, RiscVEmulator& emu,
     std::ofstream file(filename, std::ios::binary);
     if (!file) return false;
     
-    // Write registers
     file.write((char*)&emu.pc, 4);
     for (int i = 1; i < 32; i++) {
         file.write((char*)&emu.regs[i], 4);
     }
     
-    // Write memory fragment
     file.write((char*)&start_addr, 4);
     file.write((char*)&size, 4);
     for (uint32_t i = 0; i < size; i++) {
@@ -594,7 +680,6 @@ int main(int argc, char* argv[]) {
     uint32_t output_size = 0;
     bool has_output = false;
     
-    // Parse arguments
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
             input_file = argv[++i];
@@ -603,82 +688,117 @@ int main(int argc, char* argv[]) {
             output_addr = strtoul(argv[++i], nullptr, 0);
             output_size = strtoul(argv[++i], nullptr, 0);
             has_output = true;
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
+            g_debug = true;
         }
     }
     
     if (input_file.empty()) {
-        std::cerr << "Usage: " << argv[0] << " -i <input_file> [-o <output_file> <start_addr> <size>]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " -i <input_file> [-o <output_file> <start_addr> <size>] [-d]" << std::endl;
         return 1;
     }
     
-    // Run with LRU
-    RiscVEmulator emu_lru(true);
-    if (!read_input_file(input_file.c_str(), emu_lru)) {
-        std::cerr << "Failed to read input file: " << input_file << std::endl;
-        return 1;
-    }
-    emu_lru.run();
-    
-    // Run with bit-pLRU
-    RiscVEmulator emu_plru(false);
-    if (!read_input_file(input_file.c_str(), emu_plru)) {
-        std::cerr << "Failed to read input file: " << input_file << std::endl;
-        return 1;
-    }
-    emu_plru.run();
-    
-    // Calculate hit rates
-    double lru_hit_rate = 0.0, lru_instr_rate = 0.0, lru_data_rate = 0.0;
-    double plru_hit_rate = 0.0, plru_instr_rate = 0.0, plru_data_rate = 0.0;
-    
-    uint64_t lru_total = emu_lru.cache->instr_access + emu_lru.cache->data_access;
-    uint64_t lru_hits = emu_lru.cache->instr_hit + emu_lru.cache->data_hit;
-    
-    if (lru_total > 0) lru_hit_rate = (double)lru_hits / lru_total * 100.0;
-    if (emu_lru.cache->instr_access > 0) 
-        lru_instr_rate = (double)emu_lru.cache->instr_hit / emu_lru.cache->instr_access * 100.0;
-    if (emu_lru.cache->data_access > 0)
-        lru_data_rate = (double)emu_lru.cache->data_hit / emu_lru.cache->data_access * 100.0;
-    
-    uint64_t plru_total = emu_plru.cache->instr_access + emu_plru.cache->data_access;
-    uint64_t plru_hits = emu_plru.cache->instr_hit + emu_plru.cache->data_hit;
-    
-    if (plru_total > 0) plru_hit_rate = (double)plru_hits / plru_total * 100.0;
-    if (emu_plru.cache->instr_access > 0)
-        plru_instr_rate = (double)emu_plru.cache->instr_hit / emu_plru.cache->instr_access * 100.0;
-    if (emu_plru.cache->data_access > 0)
-        plru_data_rate = (double)emu_plru.cache->data_hit / emu_plru.cache->data_access * 100.0;
-    
-    // Print results
-    printf("| replacement | hit_rate | instr_hit_rate | data_hit_rate | instr_access | instr_hit | data_access | data_hit |\n");
-    printf("| :---------- | :-----: | -------------: | ------------: | -----------: | ---------: | ----------: | --------: |\n");
-    
-    if (lru_total == 0) {
-        printf("| LRU | nan%% | nan%% | nan%% | %12d | %12d | %12d | %12d |\n",
-               0, 0, 0, 0);
-    } else {
-        printf("| LRU | %3.4f%% | %3.4f%% | %3.4f%% | %12lu | %12lu | %12lu | %12lu |\n",
-               lru_hit_rate, lru_instr_rate, lru_data_rate,
-               (unsigned long)emu_lru.cache->instr_access, (unsigned long)emu_lru.cache->instr_hit,
-               (unsigned long)emu_lru.cache->data_access, (unsigned long)emu_lru.cache->data_hit);
-    }
-    
-    if (plru_total == 0) {
-        printf("| bpLRU | nan%% | nan%% | nan%% | %12d | %12d | %12d | %12d |\n",
-               0, 0, 0, 0);
-    } else {
-        printf("| bpLRU | %3.4f%% | %3.4f%% | %3.4f%% | %12lu | %12lu | %12lu | %12lu |\n",
-               plru_hit_rate, plru_instr_rate, plru_data_rate,
-               (unsigned long)emu_plru.cache->instr_access, (unsigned long)emu_plru.cache->instr_hit,
-               (unsigned long)emu_plru.cache->data_access, (unsigned long)emu_plru.cache->data_hit);
-    }
-    
-    // Write output if requested
-    if (has_output) {
-        if (!write_output_file(output_file.c_str(), emu_lru, output_addr, output_size)) {
-            std::cerr << "Failed to write output file: " << output_file << std::endl;
+    try {
+        // Run with LRU
+        RiscVEmulator emu_lru(true);
+        if (!read_input_file(input_file.c_str(), emu_lru)) {
+            std::cerr << "Failed to read input file: " << input_file << std::endl;
             return 1;
         }
+        emu_lru.run();
+        
+        // Run with bit-pLRU
+        RiscVEmulator emu_plru(false);
+        if (!read_input_file(input_file.c_str(), emu_plru)) {
+            std::cerr << "Failed to read input file: " << input_file << std::endl;
+            return 1;
+        }
+        emu_plru.run();
+        
+        // Calculate hit rates
+        double lru_hit_rate = 0.0, lru_instr_rate = 0.0, lru_data_rate = 0.0;
+        double plru_hit_rate = 0.0, plru_instr_rate = 0.0, plru_data_rate = 0.0;
+        
+        uint64_t lru_total = emu_lru.cache->stats.instr_access + 
+                             emu_lru.cache->stats.data_read_access + 
+                             emu_lru.cache->stats.data_write_access;
+        uint64_t lru_hits = emu_lru.cache->stats.instr_hit + 
+                            emu_lru.cache->stats.data_read_hit + 
+                            emu_lru.cache->stats.data_write_hit;
+        
+        if (lru_total > 0) lru_hit_rate = (double)lru_hits / lru_total * 100.0;
+        if (emu_lru.cache->stats.instr_access > 0) 
+            lru_instr_rate = (double)emu_lru.cache->stats.instr_hit / emu_lru.cache->stats.instr_access * 100.0;
+        
+        uint64_t lru_data_total = emu_lru.cache->stats.data_read_access + emu_lru.cache->stats.data_write_access;
+        uint64_t lru_data_hits = emu_lru.cache->stats.data_read_hit + emu_lru.cache->stats.data_write_hit;
+        if (lru_data_total > 0)
+            lru_data_rate = (double)lru_data_hits / lru_data_total * 100.0;
+        
+        uint64_t plru_total = emu_plru.cache->stats.instr_access + 
+                              emu_plru.cache->stats.data_read_access + 
+                              emu_plru.cache->stats.data_write_access;
+        uint64_t plru_hits = emu_plru.cache->stats.instr_hit + 
+                             emu_plru.cache->stats.data_read_hit + 
+                             emu_plru.cache->stats.data_write_hit;
+        
+        if (plru_total > 0) plru_hit_rate = (double)plru_hits / plru_total * 100.0;
+        if (emu_plru.cache->stats.instr_access > 0)
+            plru_instr_rate = (double)emu_plru.cache->stats.instr_hit / emu_plru.cache->stats.instr_access * 100.0;
+        
+        uint64_t plru_data_total = emu_plru.cache->stats.data_read_access + emu_plru.cache->stats.data_write_access;
+        uint64_t plru_data_hits = emu_plru.cache->stats.data_read_hit + emu_plru.cache->stats.data_write_hit;
+        if (plru_data_total > 0)
+            plru_data_rate = (double)plru_data_hits / plru_data_total * 100.0;
+        
+        // Print results in required format
+        printf("| replacement | hit_rate | instr_hit_rate | data_hit_rate | instr_access | instr_hit | data_access | data_hit |\n");
+        printf("| :---------- | :-----: | -------------: | ------------: | -----------: | ---------: | ----------: | --------: |\n");
+        
+        if (lru_total == 0) {
+            printf("| LRU | nan%% | nan%% | nan%% | %12d | %12d | %12d | %12d |\n",
+                   0, 0, 0, 0);
+        } else {
+            printf("| LRU | %3.4f%% | %3.4f%% | %3.4f%% | %12lu | %12lu | %12lu | %12lu |\n",
+                   lru_hit_rate, lru_instr_rate, lru_data_rate,
+                   (unsigned long)emu_lru.cache->stats.instr_access, 
+                   (unsigned long)emu_lru.cache->stats.instr_hit,
+                   (unsigned long)lru_data_total, 
+                   (unsigned long)lru_data_hits);
+        }
+        
+        if (plru_total == 0) {
+            printf("| bpLRU | nan%% | nan%% | nan%% | %12d | %12d | %12d | %12d |\n",
+                   0, 0, 0, 0);
+        } else {
+            printf("| bpLRU | %3.4f%% | %3.4f%% | %3.4f%% | %12lu | %12lu | %12lu | %12lu |\n",
+                   plru_hit_rate, plru_instr_rate, plru_data_rate,
+                   (unsigned long)emu_plru.cache->stats.instr_access, 
+                   (unsigned long)emu_plru.cache->stats.instr_hit,
+                   (unsigned long)plru_data_total, 
+                   (unsigned long)plru_data_hits);
+        }
+        
+        // Print detailed stats if debug enabled
+        if (g_debug) {
+            printf("\n=== LRU Statistics ===\n");
+            emu_lru.cache->print_detailed_stats();
+            
+            printf("\n=== bit-pLRU Statistics ===\n");
+            emu_plru.cache->print_detailed_stats();
+        }
+        
+        // Write output if requested
+        if (has_output) {
+            if (!write_output_file(output_file.c_str(), emu_lru, output_addr, output_size)) {
+                std::cerr << "Failed to write output file: " << output_file << std::endl;
+                return 1;
+            }
+        }
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
     }
     
     return 0;
